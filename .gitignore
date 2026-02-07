@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Vector store / cache
+.cache/
+*.faiss
+*.pkl
+
+# OS
+.DS_Store
