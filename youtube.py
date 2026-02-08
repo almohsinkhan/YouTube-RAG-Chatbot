@@ -1,146 +1,214 @@
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_core.prompts import PromptTemplate
 from youtube_transcript_api import YouTubeTranscriptApi
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
-from transformers import AutoTokenizer
-from langchain_core.prompts import PromptTemplate
+from youtube_transcript_api._errors import (
+    TranscriptsDisabled,
+    NoTranscriptFound,
+    VideoUnavailable
+    )
+import os
+import re
+import math
 
 
 class YouTubeProcessor:
     """
-    A class to process YouTube video transcripts for LLM applications.
-    
-    Key functionalities:
-    1. fetch transcripts using youtube-transcript-api.
-    2. split transcripts into manageable chunks using langchain's RecursiveCharacterTextSplitter.
-    3. generate embeddings using langchain's HuggingFaceEmbeddings for indexing.
-    4. store in a vector store using FAISS for efficient retrieval.
+    Processes YouTube transcripts into a FAISS vector store.
     """
 
     def __init__(self, video_id: str):
         self.video_id = video_id
-
-        # Fetch and store the transcript
         self.transcript = self._get_youtube_transcript()
-
-        # Split the transcript into chunks
         self.chunked_text = self._split_transcript()
-
-        # Create the vector store
-        self.vector_store = self._create_vector_store()
-        
+        self.vector_store = self._create_vector_store(self.chunked_text, "main")
+        self.summary = self._summarize_transcript()
+        self.summary_vector_store = self._create_vector_store(
+            [self.summary], "summary"
+        )
+  
 
     def _get_youtube_transcript(self) -> str:
-        """Fetches the transcript for the YouTube video ID and returns it as a single string."""
-        ytt_api = YouTubeTranscriptApi()
-        transcripts = ytt_api.fetch(self.video_id)
-        full_transcript = " ".join([t.text for t in transcripts])
-        return full_transcript
-    
+        try:
+            ytt_api = YouTubeTranscriptApi()
+            transcripts = ytt_api.fetch(self.video_id)
+            return " ".join(t.text for t in transcripts)
+
+        except (TranscriptsDisabled, NoTranscriptFound):
+            raise RuntimeError(
+                f"This video does not have captions enabled: {e}"
+            )
+
+        except VideoUnavailable:
+            raise RuntimeError(
+                "The video is unavailable or restricted."
+            )
+
+    def _summarize_transcript(self) -> str:
+        llm = ChatOllama(model="llama3", temperature=0)
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=4000,
+            chunk_overlap=300
+        )
+        chunks = splitter.split_text(self.transcript)
+
+        # MAP
+        summaries = []
+        for chunk in chunks:
+            prompt = f"""
+            Summarize the following part of a video transcript concisely.
+
+            Text:
+            {chunk}
+            """
+            response = llm.invoke(prompt)
+            summaries.append(response.content)
+
+        # REDUCE
+        combined = "\n\n".join(summaries)
+        
+        final_prompt = f"""
+        You are given summaries of parts of a video.
+        Combine them into ONE clear, structured summary.
+
+        Summaries:
+        {combined}
+        """
+        final_response = llm.invoke(final_prompt)
+        return final_response.content
+
+
+
     def _split_transcript(self) -> list:
-        """Splits the transcript into chunks for further processing."""
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
-            chunk_overlap=200,
+            chunk_overlap=200
         )
         return splitter.split_text(self.transcript)
-    
-    def _create_vector_store(self):
-        """Creates a FAISS vector store from the chunked text."""
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'}
-        )
-        vector_store = FAISS.from_texts(self.chunked_text, embedding=embeddings)
-        return vector_store
-    
+
+
+    def _create_vector_store(self, texts, sub_dir="main"):
+        cache_dir = f".cache/{self.video_id}/{sub_dir}"
+        os.makedirs(cache_dir, exist_ok=True)
+
+        embeddings = OllamaEmbeddings(model="nomic-embed-text")
+
+        if os.path.exists(os.path.join(cache_dir, "index.faiss")):
+            return FAISS.load_local(
+                cache_dir,
+                embeddings,
+                allow_dangerous_deserialization=True
+            )
+
+        store = FAISS.from_texts(texts, embeddings)
+        store.save_local(cache_dir)
+
+        return store
+
+
+
 
 class YouTubeChatbot:
     """
-    A class to create a chatbot that can answer questions based on YouTube video transcripts.
-    
-    Key functionalities:
-    1. Create an LLM model using HuggingFace.
-    2. Retrieve relevant chunks from the vector store based on user queries.
-    3. Generate responses using the LLM model based on the retrieved context.
+    Chatbot that answers questions using retrieved transcript chunks.
     """
 
-    def __init__(self, vector_store, llm_model=None):
+    def __init__(self, vector_store):
         self.vector_store = vector_store
-        self.llm_model = llm_model if llm_model else self._create_llm_model()
+        self.llm = ChatOllama(model="llama3", temperature=0, streaming=True)
+
+    def answer_stream(self, question: str, k: int = 3):
+        docs = self.vector_store.similarity_search(question, k=k)
+        context = "\n\n".join(doc.page_content for doc in docs)
+
+        prompt = PROMPT.format(context=context, question=question)
+
+        for chunk in self.llm.stream(prompt):
+            if chunk.content:
+                print(chunk.content, end="", flush=True)
 
 
-    def _create_llm_model(self):
-        """Function to create and return the LLM model."""
-        model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+def extract_video_id(url: str) -> str:
+    patterns = [
+        r"v=([a-zA-Z0-9_-]{11})",
+        r"youtu\.be/([a-zA-Z0-9_-]{11})",
+        r"embed/([a-zA-Z0-9_-]{11})"
+    ]
 
-        # 1. Explicitly load the tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
 
-        # 2. Setup the pipeline
-        llm = HuggingFacePipeline.from_model_id(
-            model_id=model_id,
-            task="text-generation",
-            pipeline_kwargs={
-                "temperature": 0.7,
-                "max_new_tokens": 256, # Added to prevent the response from cutting off
-            },
-            model_kwargs={
-                "torch_dtype": "auto",
-                "low_cpu_mem_usage": True,
-            }
-        )
-
-        # 3. Initialize ChatHuggingFace with the tokenizer
-        # This ensures the Chat Template for TinyLlama is applied correctly
-        model = ChatHuggingFace(llm=llm, tokenizer=tokenizer)
-        return model
-    
-
-    
+    raise ValueError("Invalid YouTube URL")
 
 
-prompt_template = PromptTemplate(
+PROMPT = PromptTemplate(
     input_variables=["context", "question"],
-    template="""<|system|>
-You are a concise assistant. Use ONLY the provided context to answer. 
-If the answer is not in the context, say "The provided video transcript does not mention this."
-Do not provide any explanation, headers, or extra text. Give only the direct answer.</s>
-<|user|>
-Context: {context}
+    template="""
+You are a concise assistant.
+Answer ONLY using the context below.
+If the answer is not present, say:
+"The provided video transcript does not mention this."
 
-Question: {question}</s>
-<|assistant|>
+Context:
+{context}
+
+Question:
+{question}
 """
 )
 
-def build_chatbot(video_id: str) -> YouTubeChatbot:
-    """Create a YouTubeChatbot instance for a given YouTube video ID."""
+
+def retrieval_confidence(vector_store, question: str, k: int = 3) -> float:
+    results = vector_store.similarity_search_with_score(question, k=k)
+    if not results:
+        return 100.0  # High distance, poor match
+    
+    # Simple average of L2 distancesa
+    # Lower usage means closer match.
+    total_score = sum(score for _, score in results)
+    return total_score / len(results)
+
+
+def build_chatbot(video_url: str, question: str) -> YouTubeChatbot:
+    video_id = extract_video_id(video_url)
     processor = YouTubeProcessor(video_id)
-    return YouTubeChatbot(processor.vector_store)
+    
+    # Check if the question is specific enough to answer from chunks
+    # or if we should fall back to the summary.
+    # L2 Distance: Lower is better.
+    # Threshold 0.5 is heuristic; adjust based on embeddings model.
+    score = retrieval_confidence(processor.vector_store, question)
+    
+    print(f"Retrieval Score (Distance): {score:.4f}")
+
+    if score < 0.8:
+        # Good match found in chunks -> Use detailed chunks
+        # This roughly corresponds to "Global" search in specific content? 
+        # Or "Local" in the sense of finding specific locations.
+        # Naming convention: Detailed/Specific vs Summary/General.
+        print("Using detailed transcript (Specific Query)")
+        return YouTubeChatbot(processor.vector_store)
+    else:
+        # Poor match in chunks -> Use summary
+        print("Using summary (General/Global Query)")
+        return YouTubeChatbot(processor.summary_vector_store)
 
 
-def answer_question(bot: YouTubeChatbot, question: str, k: int = 3) -> str:
-    retrieval = bot.vector_store.similarity_search(question, k=k)
-    context = "\n\n".join([doc.page_content for doc in retrieval])
-    
-    raw_response = bot.llm_model.invoke([
-        ("system", "You are a helpful assistant."),
-        ("human", prompt_template.format(context=context, question=question))
-    ])
-    
-    # TinyLlama cleanup: sometimes it repeats the prompt. 
-    # This logic helps extract just the new text.
-    content = raw_response.content
-    return content
+
 
 def main():
-    video_id = input("Enter YouTube Video ID: ")
+    video_url = input("Enter YouTube Video URL: ")
     question = input("Enter your question: ")
-    bot = build_chatbot(video_id)
-    answer = answer_question(bot, question)
-    print("Answer:", answer)
+
+    bot = build_chatbot(video_url, question)
+
+    print("\nAnswer:\n")
+    bot.answer_stream(question)
+
 
 if __name__ == "__main__":
     main()
