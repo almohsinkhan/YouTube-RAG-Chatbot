@@ -3,6 +3,7 @@ from langchain_core.prompts import PromptTemplate
 from youtube_transcript_api import YouTubeTranscriptApi
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+from langchain_community.docstore.in_memory import InMemoryDocstore
 from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
@@ -11,6 +12,7 @@ from youtube_transcript_api._errors import (
 import os
 import re
 import math
+import faiss
 
 
 class YouTubeProcessor:
@@ -24,10 +26,7 @@ class YouTubeProcessor:
         self.chunked_text = self._split_transcript()
         self.vector_store = self._create_vector_store(self.chunked_text, "main")
         self.summary = self._summarize_transcript()
-        self.summary_vector_store = self._create_vector_store(
-            [self.summary], "summary"
-        )
-  
+
 
     def _get_youtube_transcript(self) -> str:
         try:
@@ -35,7 +34,7 @@ class YouTubeProcessor:
             transcripts = ytt_api.fetch(self.video_id)
             return " ".join(t.text for t in transcripts)
 
-        except (TranscriptsDisabled, NoTranscriptFound):
+        except (TranscriptsDisabled, NoTranscriptFound) as e:
             raise RuntimeError(
                 f"This video does not have captions enabled: {e}"
             )
@@ -94,15 +93,34 @@ class YouTubeProcessor:
         os.makedirs(cache_dir, exist_ok=True)
 
         embeddings = OllamaEmbeddings(model="nomic-embed-text")
-
+        
+        # nomic-embed-text = 768 dimensions
+        dimension = 768 
+        
         if os.path.exists(os.path.join(cache_dir, "index.faiss")):
+            # load_local already knows how to load the HNSW structure from disk
             return FAISS.load_local(
                 cache_dir,
                 embeddings,
                 allow_dangerous_deserialization=True
             )
 
-        store = FAISS.from_texts(texts, embeddings)
+        # 1. Create the HNSW index manually
+        # M=32 is the number of connections; higher = more accurate but more memory
+        index = faiss.IndexHNSWFlat(dimension, 32)
+        
+        # 2. Initialize the LangChain FAISS wrapper with the custom index
+        store = FAISS(
+            embedding_function=embeddings,
+            index=index,
+            docstore=InMemoryDocstore(),
+            index_to_docstore_id={}
+        )
+
+        # 3. Add the texts (this will now use the HNSW structure)
+        store.add_texts(texts)
+        
+        # 4. Save for next time
         store.save_local(cache_dir)
 
         return store
@@ -120,11 +138,30 @@ class YouTubeChatbot:
         self.llm = ChatOllama(model="llama3", temperature=0, streaming=True)
 
     def answer_stream(self, question: str, k: int = 3):
+        if self.vector_store is None:
+            self.answer_global(question)
+            return 
+        
         docs = self.vector_store.similarity_search(question, k=k)
         context = "\n\n".join(doc.page_content for doc in docs)
 
         prompt = PROMPT.format(context=context, question=question)
 
+        for chunk in self.llm.stream(prompt):
+            if chunk.content:
+                print(chunk.content, end="", flush=True)
+
+
+    def answer_global(self, question: str):
+        prompt = f"""
+        You are answering a question about the OVERALL video.
+
+        Video Summary:
+        {self.summary}
+
+        Question:
+        {question}
+        """
         for chunk in self.llm.stream(prompt):
             if chunk.content:
                 print(chunk.content, end="", flush=True)
@@ -148,10 +185,10 @@ def extract_video_id(url: str) -> str:
 PROMPT = PromptTemplate(
     input_variables=["context", "question"],
     template="""
-You are a concise assistant.
-Answer ONLY using the context below.
-If the answer is not present, say:
-"The provided video transcript does not mention this."
+You are a helpful assistant.
+Answer the question below using the provided context.
+If the answer is not fully in the context, you can use your own knowledge to provide a helpful response.
+Do not restrict yourself to only the provided context if it doesn't contain the answer.
 
 Context:
 {context}
@@ -160,6 +197,8 @@ Question:
 {question}
 """
 )
+
+
 
 
 def retrieval_confidence(vector_store, question: str, k: int = 3) -> float:
@@ -186,28 +225,27 @@ def build_chatbot(video_url: str, question: str) -> YouTubeChatbot:
     print(f"Retrieval Score (Distance): {score:.4f}")
 
     if score < 0.8:
-        # Good match found in chunks -> Use detailed chunks
-        # This roughly corresponds to "Global" search in specific content? 
-        # Or "Local" in the sense of finding specific locations.
-        # Naming convention: Detailed/Specific vs Summary/General.
-        print("Using detailed transcript (Specific Query)")
+        print("Using detailed transcript (Local Query)")
         return YouTubeChatbot(processor.vector_store)
     else:
-        # Poor match in chunks -> Use summary
-        print("Using summary (General/Global Query)")
-        return YouTubeChatbot(processor.summary_vector_store)
-
+        print("Using global summary")
+        bot = YouTubeChatbot(None)
+        bot.summary = processor.summary
+        return bot
 
 
 
 def main():
     video_url = input("Enter YouTube Video URL: ")
-    question = input("Enter your question: ")
+    while True:
+        question = input("Enter your question: ")
+        if question == "exit":
+            break
+        bot = build_chatbot(video_url, question)
 
-    bot = build_chatbot(video_url, question)
-
-    print("\nAnswer:\n")
-    bot.answer_stream(question)
+        print("\nAnswer:\n")
+        bot.answer_stream(question)
+        print("\n")
 
 
 if __name__ == "__main__":
